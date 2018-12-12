@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class FeatureExtraction():
+class FeatureExtraction:
 	'''A feature extraction module
 	'''
 @staticmethod
@@ -41,7 +41,9 @@ def preprocess(column):
     from name_tools import split
     
     if column is None:
-        return ''
+        return ''iled: File hello.py was already registered with a different path (old path = /opt/spark/spark-2.3.1-bin-hadoop2.7/hello.py, new path = hello.py
+	at scala.Predef$.require(Predef.scala:224)
+
     else: 
         m = split(column)
         if(m[1]==''):

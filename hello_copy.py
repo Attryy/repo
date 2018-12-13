@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+import warnings
+warnings.filterwarnings('ignore')
 import flask
 import json
 from flask import Flask 
@@ -34,9 +36,8 @@ from fuzzywuzzy import fuzz
 import itertools
 import geopy
 from pyspark.sql.types import Row
-from geopy import distance
-
 from jellyfish import levenshtein_distance as ld
+import pickle
 
 from featureExtraction import FeatureExtraction 
 
@@ -215,17 +216,25 @@ def similarities(linkedin_id, gid, lookupTable):
           pro_pub_desc_simi = _cosine_similarity(X['_pro_pub_descIDF'], Y['_pro_pub_descIDF'])
           return gitlang_simi, skill_simi, edu_exp_simi, bio_simi, exp_desc_simi, summary_simi, pro_pub_title_simi, pro_pub_desc_simi    
 
+def warn(*args, **kwargs):
+    pass
 
 
 @app.route('/hello',methods =['POST'])
 def classification():
-	#grabs the Linkedin data tagged as 'linkedin'
-	linkedin = request.get_json()['linkedin'] # dictionary object
-        linkedin = json.dumps(linkedin) # convert the list object into a json-format string 
+
+        import warnings
+        warnings.warn = warn
+
+	#grabs the Linkedin data tagged as 'linkedin' as a dictionary object 
+	linkedin = request.get_json()['linkedin']
+        # convert the dictionary object into a json-format string 
+        linkedin = json.dumps(linkedin) 
+
 	github = request.get_json()['github']
 	github = json.dumps(github)
 
-
+        #specify the github and linkedin data schema to avoid empty field not being included
         GitSchema = StructType([
             StructField("repos",ArrayType(StructType([StructField("lang", ArrayType(StringType())),StructField("isFork", BooleanType(), False),StructField("description", StringType(), False),StructField("name", StringType(), False),StructField("readme", StringType(), False), StructField("url", StringType(), False)]))),
             StructField("git_org", ArrayType(StringType())),
@@ -259,22 +268,21 @@ def classification():
    ])
 
 
-
+        # initialize the spark session and sqlContext 
 	sc = init_spark_context()
-    #sc = spark.sparkContext
 	sqlContext = SQLContext(sc)
 
         rddLink = sc.parallelize([linkedin])
 	rddGit = sc.parallelize([github])
-        logger.info("rddLink loaded!")
-    #logger.info(linkedin[0:7000])
-    #logger.info(rddLink)
-    #logger.info(sc._conf.getAll())
+
         LinkedinData = sqlContext.read.json(rddLink, LinkSchema)
         GithubData = sqlContext.read.json(rddGit, GitSchema)
 
 	LinkedinData.persist()
 	GithubData.persist()
+
+        logger.info('Linkedin data loaded!')
+        logger.info('Github data loaded!')
 
         logger.info('Cleaning the formatting for Linkedin data...')
 
@@ -301,6 +309,8 @@ def classification():
         GithubData = GithubData.withColumn('summary', F.concat_ws(',', F.col('_pro_pub_title'),F.col('git_email'), F.col('bio'), F.col('git_company')))
         GithubData = GithubData.withColumn('id', F.col('gid').cast("string"))
         GithubData = GithubData.withColumn('id', F.regexp_replace(F.col('id'), '([\d]+)', "g$1"))
+
+        logger.info('Loading TF-IDF model...')
         
 
         model_TFIDF = PipelineModel.load("wasb://test-container@tfsmodelstorage.blob.core.windows.net/model_tfidf0913")
@@ -310,6 +320,9 @@ def classification():
         data_join = data_join.na.fill('')
 
         data_feature = model_TFIDF.transform(data_join).select('id', 'git_langIDF','_skillsIDF', '_edu_expIDF','bioIDF', 'exp_descIDF','summaryIDF','_pro_pub_titleIDF','_pro_pub_descIDF')
+        
+        logger.info('Creating lookupTable...')
+
         lookupTable = sc.broadcast(data_feature.rdd.map(lambda x: (x['id'],
                                                   {'git_langIDF':x['git_langIDF'],
                                                    '_skillsIDF':x['_skillsIDF'],
@@ -327,11 +340,7 @@ def classification():
         joined = joined.withColumn('linkedin_id', F.col('linkedin_id').cast('string'))
 
 	pairId = joined.select('linkedin_id','gid')
-       # logger.info(pairId.show())
-       # lookupTable = feature_extraction.lookupTable
 	pairPersonDF = pairId.rdd.map(lambda x: x + similarities(x[0], x[1], lookupTable))
-       # logger.info(pairId.rdd.map(lambda x: x + similarities('213964086','g17517', lookupTable)))
-       #  logger.info(similarities('213964086','g17517', feature_extraction.lookupTable))
 	measureMapping = sqlContext.createDataFrame(pairPersonDF.map(lambda x: Row(linkedin_id=x[0], 
                                                                           gid=x[1], 
                                                                           gitlang_simi=float(x[2]),
@@ -364,6 +373,8 @@ def classification():
         df['linkweb_gitweb'] = df.apply(lambda row: leven_list(row['website'], row['git_websiteUrl']), axis = 1)
         df['linkweb_github'] = df.apply(lambda row: leven_list(row['website'], row['github_url']), axis = 1)
 
+
+        # specify the schema of the feature dataframe
         DFschema = StructType([
              StructField("linkedin_id", StringType()),
              StructField("gid", StringType()),
@@ -388,40 +399,37 @@ def classification():
         feature = dfSpark.join(measureMapping, ['linkedin_id','gid'])
 
 	fill_values = {'bio_simi': -0.7676835240063782,'company_company': 13.027269554813302,'count': 69.97936515849672,'edu_exp_simi': -0.7674423412298906,'exp_desc_simi': -0.4794768606439826,'gitlang_simi': -0.36508407687661887,'linkedin_gitblog': 0.6704111164342388,'linkedin_gitweb': 0.6704111164342388,'linkweb_gitblog': 0.5065308678618619,'linkweb_github': 0.584223292437445,'linkweb_gitweb': 0.5065308678618619,'location_fuzz_sort': 34.35918477770764,'login_fuzz': 49.54616025581677,'login_jw': 0.638835025212626,'name_dmetaphone': 0.7347467665413555,'name_fuzz': 76.757491115495,'name_jw': 0.8106706649850334,'name_leven': 4.463146574747353,'pro_pub_desc_simi': -0.7593587783269232,'pro_pub_title_simi': -0.901583569164877,'school_company': 8.18176379679944, 'skill_simi': -0.29417421426755436, 'summary_simi': -0.9685668356171937}
+
+        logger.info('Imputing the NA values in the features...')
         feature_f = feature.na.fill(fill_values)
         feature_f.persist()
+        feature_f = feature_f.toPandas()
 
-        logger.info(feature_f.show())
 
-	assembler = VectorAssembler(inputCols=feature_f.columns[2:], outputCol="features")
-	feature_assem = assembler.transform(feature_f)
+	#assembler = VectorAssembler(inputCols=feature_f.columns[2:], outputCol="features")
+	#feature_assem = assembler.transform(feature_f)
 
-	testRF= RandomForestClassificationModel.load("wasb://test-container@tfsmodelstorage.blob.core.windows.net/rfModel0914")
+	#testRF= RandomForestClassificationModel.load("wasb://test-container@tfsmodelstorage.blob.core.windows.net/rfModel0914")
 
-	rfPredict = testRF.transform(feature_assem)
-        logger.info(rfPredict.show())
-        name_list = feature_extraction.df[['linkedin_id','gid','git_login']]
-        result = name_list.join(rfPredict, on = ['linkedin_id','gid'], how = 'outer')
+	#rfPredict = testRF.transform(feature_assem)
+        #logger.info(rfPredict.show())
+        #name_list = feature_extraction.df[['linkedin_id','gid','git_login']]
+        #result = name_list.join(rfPredict, on = ['linkedin_id','gid'], how = 'outer')
     
 
 	#positive = positive.toPandas()
-        logger.info(result)
+        #logger.info(result)
+        filename = '/home/jia/Dropbox/Startup/code/Talentful/data/rfModel.sav'
+        loaded_model = pickle.load(open(filename, 'rb'))
+        logger.info('Classification Model loaded!')
+        logger.info('Predicting the potential match...')
+
+        y_score = loaded_model.predict(feature_f.loc[:,'count':])
+        name_list = df[['linkedin_id','gid','git_login']]
+        result = name_list[y_score == 1]
 
 
-
-
-
-      
-
-
-
-
-
-
-	test = link.count()
-
-
-        return ("hello, "+ linkedin[0]+"\n"+"test "+str(test)+"\n")
+        return ("Predicted github match:"+result['git_login'].to_string(index = False)+'\n')
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ The linkedin and github data can be send to the server by POST request and resul
 import warnings
 warnings.filterwarnings('ignore')
 import flask
+import os
 import json
 from flask import Flask 
 from flask import request 
@@ -56,7 +57,7 @@ logger = logging.getLogger(__name__)
 #initialize the server 
 app = flask.Flask(__name__)
 
-#define a /hello route for only post requests
+#initialize a spark context
 def init_spark_context():
     conf = SparkConf().setAppName("github-linkedin-server").setMaster("spark://10.8.0.14:7077").set("spark.driver.maxResultSize", "3.5g").set('spark.cleaner.referenceTracking','false').set("spark.executor.extraClassPath", "/opt/spark/spark-2.3.1-bin-hadoop2.7/jars/*.jar").set("spark.memory.offHeap.enabled","true").set("spark.memory.offHeap.size","5g").set("spark.jars","file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/azure-storage-2.0.0.jar,file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/hadoop-azure-2.7.7.jar").set("spark.network.timeout", "360s").set("spark.executor.heartbeatInterval","15s").set("spark.sql.catalogImplementation","hive").set("spark.dynamicAllocation.enabled","false").set("spark.driver.memory","12g").set("spark.executor.memory","26g").set("spark.driver.maxResultSize","4g").set("spark.executor.cores","3").set("spark.jars","file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/azure-storage-2.0.0.jar,file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/hadoop-azure-2.7.7.jar").set("spark.submit.deployMode", "client").set("spark.driver.port","40015").set("spark.blockManager.port","40045").set("spark.driver.blockManager.port","40075").set("spark.worker.port", "40105").set("spark.shuffle.service.port", "40135")
    # spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
@@ -69,13 +70,12 @@ def init_spark_context():
     return sc
 
 
-
 def preprocess(column):
     from name_tools import split
-    
+
     if column is None:
         return ''
-    else: 
+    else:
         m = split(column)
         if(m[1]==''):
             full_name = m[2];
@@ -91,7 +91,7 @@ def doublemetaphone(str1, str2):
     # returns null when either string is null 
     
     
-    if(str1 is None or str1 is None):
+    if(str1 is None or str1 is None  or str1 == ' ' or str2 == ' '):
         return ''
     else: 
         weight1 = 0.5
@@ -126,7 +126,7 @@ def doublemetaphone(str1, str2):
 def fuzz_sort(str1, str2):
     
     result = [];
-    if(str1 ==[] or str2==[]):
+    if(str1 ==[] or str2==[] or str1 is None or str2 is None ):
         return 0
     else:
         if(isinstance(str1, list)):
@@ -152,7 +152,7 @@ def fuzz_sort(str1, str2):
         else:
             d = fuzz.token_sort_ratio(str1, str2)
         return(d)
-
+            
 
 def leven_list(str1, str2):
     result = [];
@@ -195,7 +195,7 @@ def preprocess_company(column):
 
 
 def similarities(linkedin_id, gid, lookupTable):
-          X, Y = lookupTable[linkedin_id], lookupTable[gid]
+          X, Y = lookupTable[gid], lookupTable[linkedin_id]
 
           def _cosine_similarity(X, Y):
               denom = np.sqrt(X.multiply(X).sum(1)).item() *np.sqrt(Y.multiply(Y).sum(1)).item() 
@@ -293,8 +293,8 @@ def classification():
 
         LinkedinData= LinkedinData.withColumnRenamed('linkedin', 'linkedin_id')#.drop('linkedin_id').withColumnRenamed('linkedin','linkedin_id')
         LinkedinData = LinkedinData.withColumn('skills', F.concat_ws(',',LinkedinData.skills))
-        LinkedinData= LinkedinData.withColumn('edu_name', F.concat_ws(',', F.col('education.name')))
-        LinkedinData = LinkedinData.withColumn('exp_org', F.concat_ws(',', F.col('experience.organization')))
+        LinkedinData= LinkedinData.withColumn('edu_name', F.col('education.name'))
+        LinkedinData = LinkedinData.withColumn('exp_org', F.col('experience.organization'))
         LinkedinData = LinkedinData.withColumn('_pro_pub_title', F.concat_ws(',', F.col('projects.title'), F.col('publications.name')))
         LinkedinData = LinkedinData.withColumn('_pro_pub_desc', F.concat_ws(',', F.col('projects.description'), F.col('publications.summary')))
         LinkedinData = LinkedinData.withColumn("exp_desc", F.concat_ws(',', F.col('experience.description')))
@@ -321,10 +321,13 @@ def classification():
         data_join = data_join.na.fill('')
 
         data_joinDF = data_join.toPandas()
+        
+        PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+
 
         for name in ['git_lang','_skills','_edu_exp','bio',
              'exp_desc','summary','_pro_pub_title','_pro_pub_desc']:
-            model_path = '/home/jia/Dropbox/Startup/code/Talentful/data/'+name+'.pk'
+            model_path = os.path.join(PROJECT_ROOT, name+'.pk')
             loaded_vectorizer = pickle.load(open(model_path, 'rb'))
             logger.info('Loading TF-IDF model for '+ name+'...')
             vector = list(loaded_vectorizer.transform(data_joinDF.loc[:, name]))
@@ -333,6 +336,7 @@ def classification():
         logger.info('Creating lookupTable...')
 
         lookupTable = data_joinDF.loc[:, ['id','git_langIDF','_skillsIDF','_edu_expIDF','bioIDF', 'exp_descIDF','summaryIDF','_pro_pub_titleIDF','_pro_pub_descIDF']].set_index('id').transpose().to_dict(orient = 'dict')
+        
 
         joined = GithubData.select('gid', 'linkedin_id', 'git_login','git_name','git_location','git_company','git_blog','github_url','git_websiteUrl').join(LinkedinData.select('linkedin_id','full_name','location','edu_name','exp_org','linkedin_url',LinkedinData.websites.url.alias('website')), ['linkedin_id'])
         joined = joined.dropDuplicates(['gid','linkedin_id'])
@@ -340,7 +344,8 @@ def classification():
         count = joined.cube("linkedin_id").count()
         joined = joined.join(count,['linkedin_id'])
         joined = joined.withColumn('linkedin_id', F.col('linkedin_id').cast('string'))
-
+    
+        
 	pairId = joined.select('linkedin_id','gid')
 	pairPersonDF = pairId.rdd.map(lambda x: x + similarities(x[0], x[1], lookupTable))
 	measureMapping = sqlContext.createDataFrame(pairPersonDF.map(lambda x: Row(linkedin_id=x[0], 
@@ -355,14 +360,17 @@ def classification():
                                                                           pro_pub_desc_simi= float(x[9]))))
 	
 	df = joined.toPandas()
+        df = df.fillna(' ')
+        
+
+        df['git_company'] = df.apply(lambda row: preprocess_company(row['git_company']), axis = 1)
+        for column in ['git_name','full_name']:
+           df[column] = df.apply(lambda row: preprocess(row[column]), axis = 1)
+
         df['name_leven'] = df.apply(lambda row: ld(row['git_name'], row['full_name']), axis = 1)
         df['name_dmetaphone'] = df.apply(lambda row: doublemetaphone(row['git_name'], row['full_name']), axis = 1)
         df['name_jw'] = df.apply(lambda row: jaro_winkler(row['git_name'], row['full_name']), axis = 1)
         df['name_fuzz'] = df.apply(lambda row: fuzz_sort(row['git_name'], row['full_name']), axis = 1)
-
-	df['git_company'] = df.apply(lambda row: preprocess_company(row['git_company']), axis = 1)
-	for column in ['git_name','full_name']:
-           df[column] = df.apply(lambda row: preprocess(row[column]), axis = 1)
 
         df['login_fuzz'] = df.apply(lambda row: fuzz_sort(row['git_login'], row['full_name']), axis = 1)
         df['login_jw'] = df.apply(lambda row: jaro_winkler(row['git_login'], row['full_name']), axis = 1)
@@ -374,7 +382,7 @@ def classification():
         df['linkweb_gitblog'] = df.apply(lambda row: leven_list(row['website'], row['git_blog']), axis = 1)
         df['linkweb_gitweb'] = df.apply(lambda row: leven_list(row['website'], row['git_websiteUrl']), axis = 1)
         df['linkweb_github'] = df.apply(lambda row: leven_list(row['website'], row['github_url']), axis = 1)
-
+        
 
         # specify the schema of the feature dataframe
         DFschema = StructType([
@@ -406,15 +414,18 @@ def classification():
         feature_f = feature.na.fill(fill_values)
         feature_f.persist()
         featureDF = feature_f.toPandas()
-
-	filename = '/home/jia/Dropbox/Startup/code/Talentful/data/rfModel.sav'
+        
+        filename = os.path.join(PROJECT_ROOT, 'rfModel.sav')
         loaded_model = pickle.load(open(filename, 'rb'))
         logger.info('Classification Model loaded!')
         logger.info('Predicting the potential match...')
 
-        y_prob = loaded_model.predict_proba(featureDF[['bio_simi','edu_exp_simi','gitlang_simi','pro_pub_title_simi','pro_pub_desc_simi','skill_simi','summary_simi','exp_desc_simi','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']])
+        features = ['bio_simi','edu_exp_simi','gitlang_simi','pro_pub_title_simi','pro_pub_desc_simi','skill_simi','summary_simi','exp_desc_simi','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']
 
-        y_score = loaded_model.predict(featureDF[['bio_simi','edu_exp_simi','gitlang_simi','pro_pub_title_simi','pro_pub_desc_simi','skill_simi','summary_simi','exp_desc_simi','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']])
+
+        y_prob = loaded_model.predict_proba(featureDF[features])
+        y_score = loaded_model.predict(featureDF[features])
+
         featureDF['prediction'] = y_score
         featureDF['probability'] = [prob[1] for prob, score in zip(y_prob, y_score)]
 
@@ -428,7 +439,6 @@ def classification():
 
 
 if __name__ == "__main__":
-	print(("* Loading models and Flask starting server..."
-		"please wait until server has fully started"))
+	print(("* Loading models and starting Flask server..."))
 	app.run(host='0.0.0.0', port=5004)
 

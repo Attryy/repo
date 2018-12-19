@@ -59,15 +59,102 @@ app = flask.Flask(__name__)
 
 #initialize a spark context
 def init_spark_context():
+    global sc
+    global sqlContext
     conf = SparkConf().setAppName("github-linkedin-server").setMaster("spark://10.8.0.14:7077").set("spark.driver.maxResultSize", "3.5g").set('spark.cleaner.referenceTracking','false').set("spark.executor.extraClassPath", "/opt/spark/spark-2.3.1-bin-hadoop2.7/jars/*.jar").set("spark.memory.offHeap.enabled","true").set("spark.memory.offHeap.size","5g").set("spark.jars","file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/azure-storage-2.0.0.jar,file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/hadoop-azure-2.7.7.jar").set("spark.network.timeout", "360s").set("spark.executor.heartbeatInterval","15s").set("spark.sql.catalogImplementation","hive").set("spark.dynamicAllocation.enabled","false").set("spark.driver.memory","12g").set("spark.executor.memory","26g").set("spark.driver.maxResultSize","4g").set("spark.executor.cores","3").set("spark.jars","file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/azure-storage-2.0.0.jar,file:////opt/spark/spark-2.3.1-bin-hadoop2.7/jars/hadoop-azure-2.7.7.jar").set("spark.submit.deployMode", "client").set("spark.driver.port","40015").set("spark.blockManager.port","40045").set("spark.driver.blockManager.port","40075").set("spark.worker.port", "40105").set("spark.shuffle.service.port", "40135")
-   # spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
+   #spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
     #sc = spark.sparkContext
-    sc = SparkContext(conf=conf) #, pyFiles=['featureExtraction.py'])
+    sc = SparkContext(conf=conf)
     sc._jsc.hadoopConfiguration().set("fs.AbstractFileSystem.wasb.impl", "org.apache.hadoop.fs.azure.Wasb")
     sc._jsc.hadoopConfiguration().set("fs.wasb.impl", "org.apache.hadoop.fs.azure.NativeAzureFileSystem")
     sc._jsc.hadoopConfiguration().set("fs.azure.account.key.tfsmodelstorage.blob.core.windows.net", "WOrz8vS02QqLPDn5vWm6HQzpxInSxJ/yJP5eyhKVRTZ1tK86oJIYxSmK/xzUJHc+vfHhNFM5fH8kqNcr8C+bww==")
-    #sc = spark.sparkContext
-    return sc
+    sqlContext = SQLContext(sc)
+
+
+
+#load models and define some global variables
+def init_models():
+    global rfModel
+    global GitSchema
+    global LinkSchema
+    global DFschema
+    global fill_values
+    global features
+    global vectorizerModels
+    global vectorizer
+
+    import warnings
+    warnings.warn = warn
+
+    #specify the github and linkedin data schema to avoid empty field not being included
+    GitSchema = StructType([
+            StructField("repos",ArrayType(StructType([StructField("lang", ArrayType(StringType())),StructField("isFork", BooleanType(), False),StructField("description", StringType(), False),StructField("name", StringType(), False),StructField("readme", StringType(), False), StructField("url", StringType(), False)]))),
+            StructField("git_org", ArrayType(StringType())),
+            StructField("git_name", StringType()),
+            StructField("bio", StringType()),
+            StructField("git_location", StringType()),
+            StructField("git_company", StringType()),
+            StructField("gid", IntegerType()),
+            StructField("github_url", StringType()),
+            StructField("git_email", StringType()),
+            StructField("git_blog", StringType()),
+            StructField("git_login",StringType()),
+            StructField("git_websiteUrl", StringType()),
+            StructField("linkedin_id", IntegerType())])
+    LinkSchema = StructType([
+            StructField("education",ArrayType(StructType([StructField("major", StringType(), False),StructField("name", StringType(), False), StructField("summary", StringType(), False)]))),
+            StructField("experience", ArrayType(StructType([StructField("description", StringType(), False),StructField("organization", StringType(), False), StructField("title", StringType(), False)]))),
+            StructField("full_name", StringType()),
+            StructField("headline", StringType()),
+            StructField("industry", StringType()),
+            StructField("interests", ArrayType(StringType())),
+            StructField("linkedin", IntegerType()),
+            StructField("linkedin_url", StringType()),
+            StructField("location", StringType()),
+            StructField("projects", ArrayType(StructType([StructField("title", StringType(), False), StructField("description", StringType(), False)]))),
+            StructField("publications",ArrayType(StructType([StructField("name", StringType(), False), StructField("summary", StringType(), False)]))),
+            StructField("skills", ArrayType(StringType())),
+            StructField("summary", StringType()),
+            StructField("websites",  ArrayType(StructType([StructField("url", StringType(), False), StructField("description", StringType(), False)])))
+   ])
+    # specify the schema of the feature dataframe
+    DFschema = StructType([
+             StructField("linkedin_id", StringType()),
+             StructField("gid", StringType()),
+             StructField("count", IntegerType()),
+             StructField("name_leven", IntegerType()),
+             StructField("name_dmetaphone", FloatType()),
+             StructField("name_jw", FloatType()),
+             StructField("name_fuzz", IntegerType()),
+             StructField("login_fuzz", IntegerType()),
+             StructField("login_jw", FloatType()),
+             StructField("location_fuzz_sort", IntegerType()),
+             StructField("school_company", IntegerType()),
+             StructField("company_company", IntegerType()),
+             StructField("linkedin_gitblog", FloatType()),
+             StructField("linkedin_gitweb", FloatType()),
+             StructField("linkweb_gitblog", FloatType()),
+             StructField("linkweb_gitweb", FloatType()),
+             StructField("linkweb_github", FloatType())
+       ])
+
+    PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+    rfModel = pickle.load(open(os.path.join(PROJECT_ROOT, 'rfModel.sav'), 'rb'))
+    logger.info('Classification Model loaded!')
+
+    vectorizerModels = []
+    vectorizer = ['git_lang','_skills','_edu_exp','bio', 'exp_desc','summary','_pro_pub_title','_pro_pub_desc']
+    for name in vectorizer:
+        model_path = os.path.join(PROJECT_ROOT, name+'.pk')
+        vectorizerModels+=[pickle.load(open(model_path, 'rb'))]
+        logger.info('Loading TF-IDF model for '+ name+'...')
+
+
+
+    fill_values = {'bio_simi': -0.7676835240063782,'company_company': 13.027269554813302,'count': 69.97936515849672,'edu_exp_simi': -0.7674423412298906,'exp_desc_simi': -0.4794768606439826,'gitlang_simi': -0.36508407687661887,'linkedin_gitblog': 0.6704111164342388,'linkedin_gitweb': 0.6704111164342388,'linkweb_gitblog': 0.5065308678618619,'linkweb_github': 0.584223292437445,'linkweb_gitweb': 0.5065308678618619,'location_fuzz_sort': 34.35918477770764,'login_fuzz': 49.54616025581677,'login_jw': 0.638835025212626,'name_dmetaphone': 0.7347467665413555,'name_fuzz': 76.757491115495,'name_jw': 0.8106706649850334,'name_leven': 4.463146574747353,'pro_pub_desc_simi': -0.7593587783269232,'pro_pub_title_simi': -0.901583569164877,'school_company': 8.18176379679944, 'skill_simi': -0.29417421426755436, 'summary_simi': -0.9685668356171937}
+    
+    features = ['bio_simi','edu_exp_simi','gitlang_simi','pro_pub_title_simi','pro_pub_desc_simi','skill_simi','summary_simi','exp_desc_simi','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']
+
 
 
 def preprocess(column):
@@ -239,44 +326,6 @@ def classification():
 	github = request.get_json()['github']
 	github = json.dumps(github)
 
-        #specify the github and linkedin data schema to avoid empty field not being included
-        GitSchema = StructType([
-            StructField("repos",ArrayType(StructType([StructField("lang", ArrayType(StringType())),StructField("isFork", BooleanType(), False),StructField("description", StringType(), False),StructField("name", StringType(), False),StructField("readme", StringType(), False), StructField("url", StringType(), False)]))),
-            StructField("git_org", ArrayType(StringType())),
-            StructField("git_name", StringType()),
-            StructField("bio", StringType()),
-            StructField("git_location", StringType()),
-            StructField("git_company", StringType()),
-            StructField("gid", IntegerType()),
-            StructField("github_url", StringType()),
-            StructField("git_email", StringType()),
-            StructField("git_blog", StringType()),      
-            StructField("git_login",StringType()),
-            StructField("git_websiteUrl", StringType()),
-            StructField("linkedin_id", IntegerType())])
-
-        LinkSchema = StructType([
-            StructField("education",ArrayType(StructType([StructField("major", StringType(), False),StructField("name", StringType(), False), StructField("summary", StringType(), False)]))),
-            StructField("experience", ArrayType(StructType([StructField("description", StringType(), False),StructField("organization", StringType(), False), StructField("title", StringType(), False)]))),
-            StructField("full_name", StringType()),
-            StructField("headline", StringType()),
-            StructField("industry", StringType()),
-            StructField("interests", ArrayType(StringType())),
-            StructField("linkedin", IntegerType()),
-            StructField("linkedin_url", StringType()),
-            StructField("location", StringType()),
-            StructField("projects", ArrayType(StructType([StructField("title", StringType(), False), StructField("description", StringType(), False)]))),
-            StructField("publications",ArrayType(StructType([StructField("name", StringType(), False), StructField("summary", StringType(), False)]))),
-            StructField("skills", ArrayType(StringType())),
-            StructField("summary", StringType()),
-            StructField("websites",  ArrayType(StructType([StructField("url", StringType(), False), StructField("description", StringType(), False)])))    
-   ])
-
-
-        # initialize the spark session and sqlContext 
-	sc = init_spark_context()
-	sqlContext = SQLContext(sc)
-
         rddLink = sc.parallelize([linkedin])
 	rddGit = sc.parallelize([github])
 
@@ -322,15 +371,10 @@ def classification():
 
         data_joinDF = data_join.toPandas()
         
-        PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 
-        for name in ['git_lang','_skills','_edu_exp','bio',
-             'exp_desc','summary','_pro_pub_title','_pro_pub_desc']:
-            model_path = os.path.join(PROJECT_ROOT, name+'.pk')
-            loaded_vectorizer = pickle.load(open(model_path, 'rb'))
-            logger.info('Loading TF-IDF model for '+ name+'...')
-            vector = list(loaded_vectorizer.transform(data_joinDF.loc[:, name]))
+        for i,name in enumerate(vectorizer):
+            vector = list(vectorizerModels[i].transform(data_joinDF.loc[:, name]))
             data_joinDF.loc[:,name+'IDF'] = vector
         
         logger.info('Creating lookupTable...')
@@ -384,47 +428,20 @@ def classification():
         df['linkweb_github'] = df.apply(lambda row: leven_list(row['website'], row['github_url']), axis = 1)
         
 
-        # specify the schema of the feature dataframe
-        DFschema = StructType([
-             StructField("linkedin_id", StringType()),
-             StructField("gid", StringType()),
-             StructField("count", IntegerType()),
-             StructField("name_leven", IntegerType()),
-             StructField("name_dmetaphone", FloatType()),
-             StructField("name_jw", FloatType()),
-             StructField("name_fuzz", IntegerType()),
-             StructField("login_fuzz", IntegerType()),
-             StructField("login_jw", FloatType()),
-             StructField("location_fuzz_sort", IntegerType()),
-             StructField("school_company", IntegerType()),
-             StructField("company_company", IntegerType()),
-             StructField("linkedin_gitblog", FloatType()),
-             StructField("linkedin_gitweb", FloatType()),
-             StructField("linkweb_gitblog", FloatType()),
-             StructField("linkweb_gitweb", FloatType()),
-             StructField("linkweb_github", FloatType())
-       ])
         dfSpark = sqlContext.createDataFrame(df[['linkedin_id','gid','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']], DFschema)
 
         feature = dfSpark.join(measureMapping, ['linkedin_id','gid'])
-
-	fill_values = {'bio_simi': -0.7676835240063782,'company_company': 13.027269554813302,'count': 69.97936515849672,'edu_exp_simi': -0.7674423412298906,'exp_desc_simi': -0.4794768606439826,'gitlang_simi': -0.36508407687661887,'linkedin_gitblog': 0.6704111164342388,'linkedin_gitweb': 0.6704111164342388,'linkweb_gitblog': 0.5065308678618619,'linkweb_github': 0.584223292437445,'linkweb_gitweb': 0.5065308678618619,'location_fuzz_sort': 34.35918477770764,'login_fuzz': 49.54616025581677,'login_jw': 0.638835025212626,'name_dmetaphone': 0.7347467665413555,'name_fuzz': 76.757491115495,'name_jw': 0.8106706649850334,'name_leven': 4.463146574747353,'pro_pub_desc_simi': -0.7593587783269232,'pro_pub_title_simi': -0.901583569164877,'school_company': 8.18176379679944, 'skill_simi': -0.29417421426755436, 'summary_simi': -0.9685668356171937}
 
         logger.info('Imputing the NA values in the features...')
         feature_f = feature.na.fill(fill_values)
         feature_f.persist()
         featureDF = feature_f.toPandas()
         
-        filename = os.path.join(PROJECT_ROOT, 'rfModel.sav')
-        loaded_model = pickle.load(open(filename, 'rb'))
-        logger.info('Classification Model loaded!')
         logger.info('Predicting the potential match...')
 
-        features = ['bio_simi','edu_exp_simi','gitlang_simi','pro_pub_title_simi','pro_pub_desc_simi','skill_simi','summary_simi','exp_desc_simi','count','name_leven','name_dmetaphone','name_jw','name_fuzz','login_fuzz','login_jw','location_fuzz_sort','school_company','company_company','linkedin_gitblog','linkedin_gitweb','linkweb_gitblog','linkweb_gitweb','linkweb_github']
 
-
-        y_prob = loaded_model.predict_proba(featureDF[features])
-        y_score = loaded_model.predict(featureDF[features])
+        y_prob = rfModel.predict_proba(featureDF[features])
+        y_score = rfModel.predict(featureDF[features])
 
         featureDF['prediction'] = y_score
         featureDF['probability'] = [prob[1] for prob, score in zip(y_prob, y_score)]
@@ -439,6 +456,7 @@ def classification():
 
 
 if __name__ == "__main__":
-	print(("* Loading models and starting Flask server..."))
-	app.run(host='0.0.0.0', port=5004)
-
+    print("* Loading models and starting Flask server...")
+    init_spark_context()
+    init_models()
+    app.run(host='0.0.0.0', port=5004)
